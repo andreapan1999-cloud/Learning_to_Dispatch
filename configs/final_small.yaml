@@ -1,0 +1,41 @@
+simulation:
+  duration: 180
+  seed: 42
+
+network:
+  type: "synthetic"
+  synthetic:
+    layout: "grid"
+    width: 12
+    height: 12
+    node_spacing: 0.8
+
+output:
+  dir: "outputs"
+
+travel_time:
+  time_step_min: 5
+  filename: "travel_times.csv"
+  base_speed_kmph: 24.0
+  peak_speed_kmph: 13.0
+  peak_hours:
+    - [11, 13]
+    - [17, 19]
+  speed_noise_std: 0.10
+
+orders:
+  filename: "orders.csv"
+  n_orders: 300
+  p_center: 0.45
+  hour_weights: [1,1,1,1,1,2,3,6,8,8,5,7,7,5,5,6,9,9,7,4,2,1,1,1]
+
+riders:
+  filename: "riders.csv"
+  n_riders: 30
+  p_center: 0.25
+  earliest_start_min: 0
+  latest_start_min: 60
+  min_shift_min: 120
+  max_shift_min: 180
+  speed_factor_options: [0.8, 1.0, 1.2]
+  speed_factor_prob: [0.2, 0.6, 0.2]

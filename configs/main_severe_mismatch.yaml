@@ -1,0 +1,40 @@
+simulation:
+  duration: 240
+  seed: 42
+
+network:
+  type: "synthetic"
+  synthetic:
+    layout: "grid"
+    width: 20
+    height: 20
+    node_spacing: 0.5
+
+output:
+  dir: "outputs/final_main_severe_mismatch"
+
+travel_time:
+  time_step_min: 1
+  filename: "travel_times.csv"
+  base_speed_kmph: 25.0
+  peak_speed_kmph: 12.0
+  peak_hours:
+    - [11, 13]
+    - [17, 19]
+  speed_noise_std: 0.15
+
+orders:
+  filename: "orders.csv"
+  n_orders: 900
+  p_center: 0.8
+
+riders:
+  filename: "riders.csv"
+  n_riders: 60
+  p_center: 0.1
+  earliest_start_min: 0
+  latest_start_min: 60
+  min_shift_min: 180
+  max_shift_min: 360
+  speed_factor_options: [0.8, 1.0, 1.2]
+  speed_factor_prob: [0.2, 0.6, 0.2]

@@ -51,7 +51,7 @@ def generate_speed_kmph(t_min: int, cfg: Dict[str, Any], rng: random.Random) -> 
 
     speed = peak if is_peak else base
     if noise_std > 0:
-        speed = max(1e-3, rng.gauss(speed, noise_std))
+        speed = max(1e-3, float(rng.normal(loc=speed, scale=noise_std)))
 
     return speed
 

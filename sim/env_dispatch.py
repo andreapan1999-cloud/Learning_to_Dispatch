@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import bisect
+import time
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import csv
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import networkx as nx
+import math
+from typing import Optional
+
+
+
 # --- GNN calibration global cache (process-level) ---
 _GNN_CALIB_CACHE = {}
 
@@ -26,20 +33,34 @@ class DispatchEnv(gym.Env):
     def __init__(self, data_dir: str, duration: int, use_gnn_eta: bool = False,
              gnn_ckpt: str = "outputs/eta_gnn.pt",
              calibrate_gnn: bool = True, calib_samples: int = 400,
-             verbose: bool = False):
+             verbose: bool = False, debug: bool = False,
+             orders_file: str = "orders.csv", riders_file: str = "riders.csv",
+             nodes_file: str = "nodes.csv", travel_times_file: str = "travel_times.csv",
+             edges_file: str = "edges.csv", profile_hotspots: bool = False):
 
         super().__init__()
         self.verbose = bool(verbose)
+        self.debug = bool(debug)
+        self.profile_hotspots = bool(profile_hotspots)
+        self._profile_stats: Dict[str, Dict[str, float]] = {}
 
         self.data_dir = Path(data_dir)
         self.duration = int(duration)
+        self.orders_path = self.data_dir / str(orders_file)
+        self.riders_path = self.data_dir / str(riders_file)
+        self.nodes_path = self.data_dir / str(nodes_file)
+        self.travel_times_path = self.data_dir / str(travel_times_file)
+        self.edges_path = self.data_dir / str(edges_file)
 
         # ---- load CSV first (needed by gnn init & calib) ----
-        self.orders = self._load_orders(self.data_dir / "orders.csv")
-        self.riders = self._load_riders(self.data_dir / "riders.csv")
-        self.node_xy = self._load_nodes(self.data_dir / "nodes.csv")
-        self.travel_time = self._load_travel_times(self.data_dir / "travel_times.csv")
-        self.G = self._build_graph(self.data_dir / "edges.csv")
+        self.orders = self._load_orders(self.orders_path)
+        self.riders = self._load_riders(self.riders_path)
+        self.node_xy = self._load_nodes(self.nodes_path)
+        self.travel_time = self._load_travel_times(self.travel_times_path)
+        self._travel_time_bucket_times = {
+            k: [int(tb) for tb, _tt in entries] for k, entries in self.travel_time.items()
+        }
+        self.G = self._build_graph(self.edges_path)
 
         # ---- gnn flags ----
         self.use_gnn_eta = bool(use_gnn_eta)
@@ -53,6 +74,17 @@ class DispatchEnv(gym.Env):
         self.gnn_bucket_scale = None
         self.edge_scale = None
 
+        # routing state
+        self.routes = {}              # rider_id -> list of (type, order_id, node)
+        self.assigned_orders = {}     # rider_id -> list of order dict
+        self.load = {}                # rider_id -> int
+        self.order_status = {}        # order_id -> str
+        self.default_capacity = 3
+        self.capacity = {}
+        self.routes = {}  # rid -> list of stops
+        self.order_state = {}  # oid -> "waiting"|"assigned"|"picked"|"delivered"
+        self.rider_eta_remaining = {}  # rid -> minutes remaining to next stop
+       
         # ---- init gnn + calibration (cached) ----
         if self.use_gnn_eta:
             self._init_gnn_eta()
@@ -96,7 +128,31 @@ class DispatchEnv(gym.Env):
         self.riders_ep = None
         self._orders_by_t = None
         self._riders_by_t = None
-        
+        self._sp_cache = {}          
+        self._sp_cache_max = 50000    
+        self._sp_cache_bucket = 5     
+
+    def _record_hotspot(self, name: str, elapsed_s: float) -> None:
+        if not self.profile_hotspots:
+            return
+        stat = self._profile_stats.setdefault(
+            name,
+            {"calls": 0.0, "total_s": 0.0, "max_ms": 0.0},
+        )
+        stat["calls"] += 1.0
+        stat["total_s"] += float(elapsed_s)
+        stat["max_ms"] = max(float(stat["max_ms"]), float(elapsed_s) * 1e3)
+        calls = int(stat["calls"])
+        if calls <= 5 or (calls % 500 == 0):
+            avg_ms = 1e3 * float(stat["total_s"]) / max(1, calls)
+            print(
+                "[profile]",
+                f"fn={name}",
+                f"calls={calls}",
+                f"avg_ms={avg_ms:.3f}",
+                f"max_ms={float(stat['max_ms']):.3f}",
+                flush=True,
+            )
        
  
     # ---------------- CSV loaders ----------------
@@ -185,6 +241,12 @@ class DispatchEnv(gym.Env):
         self.rider_pos = {}
         self.busy_riders = []
         self.busy_until = {}
+        self.routes.clear()
+        self.order_state.clear()
+        self.rider_eta_remaining.clear()
+        self.load = {}
+        if isinstance(self.capacity, dict):
+            self.capacity = {}
 
         orders = list(self.orders)
         riders = list(self.riders)
@@ -226,15 +288,13 @@ class DispatchEnv(gym.Env):
             # fallback if missing
             return 9999.0
 
-        # entries: list[(t_bucket, tt_min)] sorted by t_bucket asc
-        # choose latest bucket not exceeding t_min
-        best_tt = entries[0][1]
-        for tb, tt in entries:
-            if tb <= t_min:
-                best_tt = tt
-            else:
-                break
-        return float(best_tt)
+        bucket_times = self._travel_time_bucket_times.get(key)
+        if not bucket_times:
+            return float(entries[0][1])
+        idx = bisect.bisect_right(bucket_times, int(t_min)) - 1
+        if idx < 0:
+            idx = 0
+        return float(entries[idx][1])
 
     def _edge_eta_time_dependent(self, u: int, v: int, t_min: int) -> float:
         # baseline: CSV lookup
@@ -384,72 +444,390 @@ class DispatchEnv(gym.Env):
     def _shortest_eta(self, src: int, dst: int, t: int) -> float:
         """
         Time-dependent shortest path ETA from src to dst at time t.
-        Edge weight is travel time from self.travel_time lookup.
+        Cached by (src,dst,time-bucket) to speed up training.
         """
+        t0 = time.perf_counter() if self.profile_hotspots else 0.0
         if src == dst:
             return 0.0
 
+        tb = (int(t) // int(self._sp_cache_bucket)) * int(self._sp_cache_bucket)
+        key = (int(src), int(dst), int(tb))
+        hit = self._sp_cache.get(key)
+        if hit is not None:
+            return float(hit)
+
         def w(u: int, v: int, d: Dict[str, Any]) -> float:
-            return float(self._edge_eta_time_dependent(u, v, t))
+            return float(self._edge_eta_time_dependent(u, v, tb))
 
         try:
-            return float(nx.shortest_path_length(self.G, src, dst, weight=w, method="dijkstra"))
+            val = float(nx.shortest_path_length(self.G, src, dst, weight=w, method="dijkstra"))
         except (nx.NetworkXNoPath, nx.NodeNotFound):
-            # fallback to Euclidean if disconnected
-            return float(self._eta_min(src, dst))
+            val = float(self._eta_min(src, dst))
+
+        # very cheap cache management
+        if len(self._sp_cache) >= int(self._sp_cache_max):
+            self._sp_cache.clear()
+
+        self._sp_cache[key] = float(val)
+        self._record_hotspot("_shortest_eta", time.perf_counter() - t0)
+        return float(val)
 
     def _get_obs(self):
         return np.array(
             [self.t, len(self.pending_orders), len(self.idle_riders)],
             dtype=np.float32,
         )
+
+    def compute_route_cost(self, route) -> float:
+        total = 0.0
+        if route is None:
+            return 0.0
+        if len(route) < 2:
+            return 0.0
+        for i in range(len(route) - 1):
+            u = int(route[i])
+            v = int(route[i + 1])
+            total += float(self._shortest_eta(u, v, self.t))
+        return float(total)
+
+    def _route_node_sequence(self, rider_id: int, rider: Optional[Dict[str, Any]] = None) -> List[int]:
+        rid = int(rider_id)
+        if rider is None:
+            rider = next((r for r in (self.idle_riders + self.busy_riders) if int(r["rider_id"]) == rid), None)
+        cur = int(self.rider_pos.get(rid, int(rider["init_node"]) if rider is not None else 0))
+        route = self.routes.get(rid, [])
+        nodes = [cur]
+        for stop in route:
+            if isinstance(stop, tuple) and len(stop) >= 3:
+                nodes.append(int(stop[2]))
+            else:
+                nodes.append(int(stop))
+        return nodes
+
+    def greedy_best_insertion(self, rider_id, new_node):
+        rid = int(rider_id)
+        route_nodes = self._route_node_sequence(rid)
+        if len(route_nodes) == 0:
+            return 0, 0.0
+
+        best_delta = float("inf")
+        best_pos = 0
+        old_cost = self.compute_route_cost(route_nodes)
+
+        for pos in range(1, len(route_nodes) + 1):
+            candidate = route_nodes[:pos] + [int(new_node)] + route_nodes[pos:]
+            new_cost = self.compute_route_cost(candidate)
+            delta = float(new_cost - old_cost)
+            if delta < best_delta:
+                best_delta = delta
+                # convert node-seq insertion pos -> stop-list insertion index
+                best_pos = int(pos - 1)
+
+        return int(best_pos), float(best_delta)
+
+    def _best_order_insertion(self, rider: Dict[str, Any], order: Dict[str, Any]) -> Tuple[int, int, float]:
+        rid = int(rider["rider_id"])
+        route = list(self.routes.get(rid, []))
+        n = len(route)
+        old_cost = self.compute_route_cost(self._route_nodes_from_stops(rider, route))
+        max_pos = getattr(self, "greedy_top_k_positions", None)
+        if max_pos is not None:
+            max_pos = max(1, int(max_pos))
+
+        best_delta = float("inf")
+        best_pick_idx = 0
+        best_drop_idx = 1
+        oid = int(order.get("order_id", -1))
+        pstop = ("pickup", oid, int(order["origin"]))
+        dstop = ("dropoff", oid, int(order["dest"]))
+
+        pick_positions = range(0, n + 1)
+        if max_pos is not None:
+            pick_positions = range(0, min(n + 1, max_pos))
+        for p in pick_positions:
+            drop_stop = n + 2
+            if max_pos is not None:
+                drop_stop = min(n + 2, p + 1 + max_pos)
+            for d in range(p + 1, drop_stop):
+                cand = list(route)
+                cand.insert(p, pstop)
+                cand.insert(d, dstop)
+                if not self._is_capacity_feasible_for_stops(rid, cand):
+                    continue
+                new_cost = self.compute_route_cost(self._route_nodes_from_stops(rider, cand))
+                delta = float(new_cost - old_cost)
+                if delta < best_delta:
+                    best_delta = delta
+                    best_pick_idx = int(p)
+                    best_drop_idx = int(d)
+
+        return int(best_pick_idx), int(best_drop_idx), float(best_delta)
+
+    def _route_nodes_from_stops(self, rider: Dict[str, Any], stops: List[Tuple[str, int, int]]) -> List[int]:
+        rid = int(rider["rider_id"])
+        cur = int(self.rider_pos.get(rid, int(rider.get("init_node", 0))))
+        nodes = [cur]
+        for stop in stops:
+            nodes.append(int(stop[2]))
+        return nodes
+
+    def _rider_capacity(self, rider_id: int) -> int:
+        rid = int(rider_id)
+        if isinstance(self.capacity, dict):
+            return int(self.capacity.get(rid, self.default_capacity))
+        return int(self.capacity)
+
+    def _is_capacity_feasible_for_stops(self, rider_id: int, stops: List[Tuple[str, int, int]]) -> bool:
+        rid = int(rider_id)
+        cap = int(self._rider_capacity(rid))
+        load_sim = int(self.load.get(rid, 0))
+        if load_sim < 0 or load_sim > cap:
+            return False
+        for stop_type, _oid, _node in stops:
+            st = str(stop_type)
+            if st == "pickup":
+                load_sim += 1
+                if load_sim > cap:
+                    return False
+            elif st == "dropoff":
+                load_sim -= 1
+                if load_sim < 0:
+                    return False
+        return True
+
+    def _order_insertion_delta_for_positions(
+        self,
+        rider: Dict[str, Any],
+        order: Dict[str, Any],
+        pickup_idx: int,
+        dropoff_idx: int,
+    ) -> float:
+        t0 = time.perf_counter() if self.profile_hotspots else 0.0
+        rid = int(rider["rider_id"])
+        route = list(self.routes.get(rid, []))
+        n = len(route)
+        p = int(pickup_idx)
+        d = int(dropoff_idx)
+        if p < 0 or p > n:
+            raise RuntimeError(f"Invalid pickup insertion index: {p}, route_len={n}")
+        if d <= p or d > (n + 1):
+            raise RuntimeError(f"Invalid dropoff insertion index: {d}, route_len={n}, pickup_idx={p}")
+
+        old_cost = self.compute_route_cost(self._route_nodes_from_stops(rider, route))
+        cand = list(route)
+        oid = int(order.get("order_id", -1))
+        cand.insert(p, ("pickup", oid, int(order["origin"])))
+        cand.insert(d, ("dropoff", oid, int(order["dest"])))
+        if not self._is_capacity_feasible_for_stops(rid, cand):
+            raise RuntimeError(
+                f"Infeasible capacity for rider {rid} at insertion (pickup={p}, dropoff={d})"
+            )
+        new_cost = self.compute_route_cost(self._route_nodes_from_stops(rider, cand))
+        self._record_hotspot("_order_insertion_delta_for_positions", time.perf_counter() - t0)
+        return float(new_cost - old_cost)
+    
+    def dispatch(
+        self,
+        rider: Dict[str, Any],
+        order: Dict[str, Any],
+        total_eta_min: float,
+        *,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        rid = int(rider["rider_id"])
+        oid = int(order.get("order_id", -1))
+        # per-rider capacity/load setup
+        if isinstance(self.capacity, dict):
+            self.capacity.setdefault(rid, int(self.default_capacity))
+        self.load.setdefault(rid, 0)
+
+        # debug (first few only)
+        if self.debug:
+            self._dbg_load_inc = getattr(self, "_dbg_load_inc", 0) + 1
+            if self._dbg_load_inc <= 10:
+                print("[dbg load++]", "t", int(self.t), "rid", rid,
+                    "load", self.load[rid], "cap", int(self._rider_capacity(rid)))
+
+        if order in self.pending_orders:
+            self.pending_orders.remove(order)
+
+        if rider in self.idle_riders:
+            self.idle_riders.remove(rider)
+
+        if rider not in self.busy_riders:
+            self.busy_riders.append(rider)
+
+        self.order_status[oid] = "assigned"
+        self.assigned_orders.setdefault(rid, []).append(order)
+
+        origin = int(order["origin"])
+        dest = int(order["dest"])
+
+        self.routes.setdefault(rid, [])
+        if meta and ("pickup_insert_idx" in meta) and ("dropoff_insert_idx" in meta):
+            pickup_idx = int(meta["pickup_insert_idx"])
+            dropoff_idx = int(meta["dropoff_insert_idx"])
+            route_delta = self._order_insertion_delta_for_positions(rider, order, pickup_idx, dropoff_idx)
+        else:
+            pickup_idx, dropoff_idx, route_delta = self._best_order_insertion(rider, order)
+            if not np.isfinite(route_delta):
+                raise RuntimeError(f"No feasible insertion for rider {rid} under capacity constraints")
+        self.routes[rid].insert(int(pickup_idx), ("pickup", oid, origin))
+        self.routes[rid].insert(int(dropoff_idx), ("dropoff", oid, dest))
+
+        rider["last_order_id"] = oid
+        rider["last_dispatch_t"] = int(self.t)
+        rider["last_route_delta"] = float(route_delta)
+
+        if meta:
+            rider["last_dispatch_meta"] = dict(meta)
+            rider["last_dispatch_meta"]["route_delta"] = float(route_delta)
+        
+        if float(self.rider_eta_remaining.get(rid, 0.0)) <= 0.0:
+            cur = int(self.rider_pos.get(rid, int(rider.get("init_node", 0))))
+            first_node = int(self.routes[rid][0][2])
+            tt = float(self._shortest_eta(cur, first_node, self.t))
+            tt /= max(1e-6, float(rider["speed_factor"]))
+            self.rider_eta_remaining[rid] = float(max(1.0, tt))
+
     def step(self, action: int):
         if self._orders_by_t is None or self._riders_by_t is None:
             self.reset()
 
         reward = 0.0
-
         self.t += 1
 
-        newly_idle = []
-        for r in self.busy_riders:
-            rid = r["rider_id"]
-            if self.busy_until.get(rid, 10**9) <= self.t:
-                newly_idle.append(r)
-
-        if newly_idle:
-            self.busy_riders = [r for r in self.busy_riders if r not in newly_idle]
-            self.idle_riders.extend(newly_idle)
-
+        # new orders
         for o in self._orders_by_t.get(self.t, []):
             self.pending_orders.append(o)
+            oid = int(o.get("order_id", -1))
+            if oid >= 0:
+                self.order_state[oid] = "waiting"
+            oid = int(o.get("order_id", -1))
+            self.order_status[oid] = "pending"
 
+        # new riders
         for r in self._riders_by_t.get(self.t, []):
             self.idle_riders.append(r)
-            self.rider_pos[r["rider_id"]] = r["init_node"]
+            rid = int(r["rider_id"])
+            self.rider_pos[rid] = int(r["init_node"])
+            self.routes.setdefault(rid, [])
+            self.assigned_orders.setdefault(rid, [])
+            self.load.setdefault(rid, 0)
+            if isinstance(self.capacity, dict):
+                self.capacity.setdefault(rid, int(self.default_capacity))
 
-        if action == 1:
-            if self.pending_orders and self.idle_riders:
-                order = self.pending_orders.pop(0)
-                rider = self.idle_riders.pop(0)
+        if int(action) == 1 and self.pending_orders and self.idle_riders:
+            rider = self.idle_riders[0]
+            order = self.pending_orders[0]
+            rid = int(rider["rider_id"])
+            cur = int(self.rider_pos.get(rid, int(rider.get("init_node", 0))))
+            o = int(order["origin"])
+            d = int(order["dest"])
+            speed = max(1e-6, float(rider.get("speed_factor", 1.0)))
+            total_eta = (
+                float(self._shortest_eta(cur, o, self.t)) + float(self._shortest_eta(o, d, self.t))
+            ) / speed
+            self.dispatch(rider, order, total_eta)
+            reward += -float(rider.get("last_route_delta", 0.0))
+        # after self.t += 1 and after new riders/orders are added
 
-                rid = rider["rider_id"]
-                rider_node = self.rider_pos[rid]
-                t_now = self.t
+    
+        def _is_off_duty(r):
+            return int(r.get("end_min", 10**9)) <= int(self.t)
 
-                eta_to_pickup = self._shortest_eta(rider_node, order["origin"], t_now) / rider["speed_factor"]
-                eta_to_dropoff = self._shortest_eta(order["origin"], order["dest"], t_now) / rider["speed_factor"]
+        off_idle = [r for r in self.idle_riders if _is_off_duty(r)]
+        off_busy = [r for r in self.busy_riders if _is_off_duty(r)]
 
-                reward -= 2.0 * (eta_to_pickup + eta_to_dropoff)
+        if off_idle:
+            self.idle_riders = [r for r in self.idle_riders if r not in off_idle]
+        if off_busy:
+            self.busy_riders = [r for r in self.busy_riders if r not in off_busy]
 
-                self.rider_pos[rid] = order["dest"]
+        for r in off_idle + off_busy:
+            rid = int(r["rider_id"])
+            self.routes.pop(rid, None)
+            self.rider_eta_remaining.pop(rid, None)
+            self.load.pop(rid, None)
+            if isinstance(self.capacity, dict):
+                self.capacity.pop(rid, None)
+            self.busy_until.pop(rid, None)
+            self.rider_pos.pop(rid, None)
+            self.assigned_orders.pop(rid, None)
 
-                import math
-                total_eta = eta_to_pickup + eta_to_dropoff
-                self.busy_until[rid] = self.t + int(math.ceil(total_eta))
-                self.busy_riders.append(rider)
+        # route execution (advance one minute)
+        all_riders = list(self.idle_riders) + list(self.busy_riders)
+
+        for r in all_riders:
+            rid = int(r["rider_id"])
+            route = self.routes.get(rid, [])
+
+            if not route:
+                self.rider_eta_remaining[rid] = 0.0
+                continue
+
+            eta_rem = float(self.rider_eta_remaining.get(rid, 0.0))
+
+            # traveling
+            if eta_rem > 0.0:
+                self.rider_eta_remaining[rid] = float(max(0.0, eta_rem - 1.0))
+                continue
+
+            # arrived at next stop
+            stop_type, oid, node = route[0]
+            node = int(node)
+            oid = int(oid)
+
+            self.rider_pos[rid] = node
+            route.pop(0)
+
+            if stop_type == "pickup":
+                assert int(self.load.get(rid, 0)) < int(self._rider_capacity(rid))
+                self.load[rid] = int(self.load.get(rid, 0)) + 1
+                self.order_status[oid] = "picked"
+
+            elif stop_type == "dropoff":
+                self.order_status[oid] = "delivered"
+                self.assigned_orders[rid] = [
+                    o for o in self.assigned_orders.get(rid, [])
+                    if int(o.get("order_id", -1)) != oid
+                ]
+                prev = int(self.load.get(rid, 0))
+                if prev > 0:
+                    self.load[rid] = prev - 1
+                    if self.debug:
+                        self._dbg_load_dec = getattr(self, "_dbg_load_dec", 0) + 1
+                        if self._dbg_load_dec <= 20:
+                            print("[dbg load--]", "t", int(self.t), "rid", rid, "load", self.load[rid])
+
+            # schedule next leg if any
+            if route:
+                next_type, next_oid, next_node = route[0]
+                cur = int(self.rider_pos.get(rid, int(r.get("init_node", 0))))
+                tt = float(self._shortest_eta(cur, int(next_node), self.t))
+                tt /= max(1e-6, float(r["speed_factor"]))
+                tt = max(1.0, tt)
+                self.rider_eta_remaining[rid] = float(tt)
             else:
-                reward -= 0.1
+                self.rider_eta_remaining[rid] = 0.0
+
+            self.routes[rid] = route
+
+        new_busy = []
+        new_idle = []
+        for r in self.idle_riders + self.busy_riders:
+            rid = int(r["rider_id"])
+            if (
+                self.load.get(rid, 0) > 0
+                or len(self.routes.get(rid, [])) > 0
+                or float(self.rider_eta_remaining.get(rid, 0.0)) > 0.0
+            ):
+                new_busy.append(r)
+            else:
+                new_idle.append(r)
+
+        self.busy_riders = new_busy
+        self.idle_riders = new_idle
 
         reward -= 0.05 * float(len(self.pending_orders))
 
@@ -458,3 +836,4 @@ class DispatchEnv(gym.Env):
         info = {}
 
         return self._get_obs(), float(reward), bool(terminated), bool(truncated), info
+

@@ -43,6 +43,7 @@ requests==2.32.5
 scipy==1.13.1
 six==1.17.0
 stable-baselines3==2.7.1
+sb3-contrib==2.7.1
 sympy==1.14.0
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
